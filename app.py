@@ -1,16 +1,48 @@
 import json
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
 import instaloader
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="Instagram Miner API", version="1.0.0")
+from instaloader.exceptions import (
+    BadCredentialsException,
+    ConnectionException,
+    LoginRequiredException,
+    PrivateProfileNotFollowedException,
+    QueryReturnedBadRequestException,
+    TwoFactorAuthRequiredException,
+)
 
+app = FastAPI(title="Instagram Miner API", version="1.1.0")
+
+# Modos de ordenação suportados
 SortMode = Literal["recent", "most_liked", "most_commented", "best_engagement"]
 
-def build_loader(session_user: Optional[str] = None) -> instaloader.Instaloader:
+
+def http_error(status_code: int, msg: str, e: Exception, debug: bool):
+    """
+    Padroniza o retorno de erro.
+    - Sempre retorna: message, error_type, error
+    - Se debug=true, também retorna stack (para diagnóstico)
+    """
+    detail = {
+        "message": msg,
+        "error_type": type(e).__name__,
+        "error": str(e),
+    }
+    if debug:
+        detail["stack"] = traceback.format_exc()
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+def build_loader(session_user: Optional[str] = None, debug: bool = False) -> instaloader.Instaloader:
+    """
+    Inicializa o Instaloader configurado para não baixar mídia (só metadados).
+    Se session_user for informado, tenta carregar uma sessão salva para reduzir bloqueios (403/429).
+    """
     L = instaloader.Instaloader(
         download_pictures=False,
         download_videos=False,
@@ -20,15 +52,14 @@ def build_loader(session_user: Optional[str] = None) -> instaloader.Instaloader:
         quiet=True,
     )
 
-    # Carrega sessão salva (recomendado para reduzir 403/429)
-    # Você cria o arquivo de sessão com o script de login (te mando abaixo).
     if session_user:
         try:
             L.load_session_from_file(session_user)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Falha ao carregar sessão '{session_user}': {e}")
+            http_error(400, f"Falha ao carregar sessão '{session_user}'.", e, debug)
 
     return L
+
 
 def mine_profile(
     username: str,
@@ -38,18 +69,38 @@ def mine_profile(
     include_caption: bool = True,
     caption_max_len: int = 2000,
     session_user: Optional[str] = None,
+    debug: bool = False,
+    # ✅ demanda do chefe (rate/performance)
+    min_rate: Optional[float] = None,
+    top_rate: Optional[int] = None,
 ) -> dict:
+    """
+    Coleta dados do perfil + posts e monta um JSON com:
+    - perfil
+    - parâmetros usados
+    - data da coleta
+    - lista de posts (com engagement_rate calculado)
+    Opcionalmente filtra por rate (engagement_rate).
+    """
     username = username.lstrip("@").strip()
     if not username:
         raise HTTPException(status_code=400, detail="username é obrigatório")
 
-    L = build_loader(session_user=session_user)
+    L = build_loader(session_user=session_user, debug=debug)
 
+    # Carrega o perfil (aqui acontecem boa parte dos 403/429)
     try:
         profile = instaloader.Profile.from_username(L.context, username)
+    except (LoginRequiredException, BadCredentialsException, TwoFactorAuthRequiredException) as e:
+        http_error(401, f"Sessão inválida ou login necessário para acessar '{username}'.", e, debug)
+    except PrivateProfileNotFollowedException as e:
+        http_error(403, f"Perfil '{username}' é privado e a sessão atual não segue o perfil.", e, debug)
+    except (ConnectionException, QueryReturnedBadRequestException) as e:
+        http_error(502, f"Falha de conexão/consulta ao Instagram ao carregar '{username}'.", e, debug)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Erro ao carregar perfil '{username}': {e}")
+        http_error(502, f"Erro inesperado ao carregar perfil '{username}'.", e, debug)
 
+    # Coleta posts (limitado por max_posts) e respeita sleep_s entre iterações
     posts = []
     try:
         for i, post in enumerate(profile.get_posts(), start=1):
@@ -76,10 +127,17 @@ def mine_profile(
             )
 
             time.sleep(max(0.0, sleep_s))
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Erro ao varrer posts de '{username}': {e}")
 
-    # Calcula engajamento simples usando followers atuais
+    except (LoginRequiredException,) as e:
+        http_error(401, f"Login necessário durante a varredura de posts de '{username}'.", e, debug)
+    except PrivateProfileNotFollowedException as e:
+        http_error(403, f"Perfil '{username}' é privado e não pode ser varrido pela sessão atual.", e, debug)
+    except (ConnectionException, QueryReturnedBadRequestException) as e:
+        http_error(502, f"Falha do Instagram durante varredura de posts de '{username}'.", e, debug)
+    except Exception as e:
+        http_error(502, f"Erro inesperado ao varrer posts de '{username}'.", e, debug)
+
+    # Calcula o rate (engagement_rate) usando followers atuais
     followers = profile.followers or 0
     for p in posts:
         if followers > 0:
@@ -87,7 +145,7 @@ def mine_profile(
         else:
             p["engagement_rate"] = None
 
-    # Ordenação no servidor (depois da coleta)
+    # Ordenação (comportamento padrão do endpoint)
     if sort == "recent":
         posts.sort(key=lambda x: x["date_utc"], reverse=True)
     elif sort == "most_liked":
@@ -96,6 +154,27 @@ def mine_profile(
         posts.sort(key=lambda x: x["comments"], reverse=True)
     elif sort == "best_engagement":
         posts.sort(key=lambda x: (x["engagement_rate"] is not None, x["engagement_rate"]), reverse=True)
+
+    # ✅ Filtro por "rate" (pedido do chefe)
+    # Observação: a biblioteca não filtra na origem; o filtro acontece no endpoint após calcular engagement_rate.
+    if (min_rate is not None) or (top_rate is not None):
+        # garante ordenação por rate para aplicar top_rate corretamente
+        posts_by_rate = sorted(
+            posts,
+            key=lambda x: (x["engagement_rate"] is not None, x["engagement_rate"]),
+            reverse=True,
+        )
+
+        if min_rate is not None:
+            posts_by_rate = [
+                p for p in posts_by_rate
+                if p["engagement_rate"] is not None and p["engagement_rate"] >= min_rate
+            ]
+
+        if top_rate is not None:
+            posts_by_rate = posts_by_rate[:top_rate]
+
+        posts = posts_by_rate
 
     out = {
         "profile": {
@@ -116,6 +195,9 @@ def mine_profile(
             "include_caption": include_caption,
             "caption_max_len": caption_max_len,
             "session_user": session_user,
+            "debug": debug,
+            "min_rate": min_rate,
+            "top_rate": top_rate,
         },
         "scraped_at_utc": datetime.now(timezone.utc).isoformat(),
         "posts": posts,
@@ -125,6 +207,7 @@ def mine_profile(
 
 @app.get("/health")
 def health():
+    """Healthcheck simples."""
     return {"ok": True}
 
 
@@ -137,7 +220,18 @@ def api_profile(
     include_caption: bool = Query(True, description="Incluir legenda no retorno"),
     caption_max_len: int = Query(2000, ge=0, le=10000, description="Limite de caracteres da legenda"),
     session_user: Optional[str] = Query(None, description="Usuário cuja sessão foi salva (load_session_from_file)"),
+    debug: bool = Query(False, description="Se true, retorna stacktrace e detalhes completos do erro"),
+    # ✅ demanda do chefe (rate/performance)
+    min_rate: Optional[float] = Query(None, ge=0.0, le=1.0, description="Filtra posts com engagement_rate >= min_rate"),
+    top_rate: Optional[int] = Query(None, ge=1, le=200, description="Retorna apenas os top N posts por engagement_rate"),
 ):
+    """
+    Endpoint principal.
+    - Retorna dados do perfil e posts
+    - Calcula engagement_rate por post
+    - Permite filtrar posts por rate via min_rate/top_rate
+    - Permite debug=true para detalhar erros
+    """
     return mine_profile(
         username=username,
         max_posts=max_posts,
@@ -146,4 +240,7 @@ def api_profile(
         include_caption=include_caption,
         caption_max_len=caption_max_len,
         session_user=session_user,
+        debug=debug,
+        min_rate=min_rate,
+        top_rate=top_rate,
     )
