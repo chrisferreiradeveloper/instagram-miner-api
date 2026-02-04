@@ -7,7 +7,9 @@ from typing import Literal, Optional
 import instaloader
 from fastapi import FastAPI, HTTPException, Query
 
-from instaloader.exceptions import (
+
+
+from instaloader.exceptions import (*
     BadCredentialsException,
     ConnectionException,
     LoginRequiredException,
@@ -70,7 +72,7 @@ def mine_profile(
     caption_max_len: int = 2000,
     session_user: Optional[str] = None,
     debug: bool = False,
-    # ✅ demanda do chefe (rate/performance)
+    # (rate/performance)
     min_rate: Optional[float] = None,
     top_rate: Optional[int] = None,
 ) -> dict:
@@ -88,7 +90,7 @@ def mine_profile(
 
     L = build_loader(session_user=session_user, debug=debug)
 
-    # Carrega o perfil (aqui acontecem boa parte dos 403/429)
+    # Carrega o perfil aqui acontecem boa parte dos 403/429
     try:
         profile = instaloader.Profile.from_username(L.context, username)
     except (LoginRequiredException, BadCredentialsException, TwoFactorAuthRequiredException) as e:
@@ -100,7 +102,7 @@ def mine_profile(
     except Exception as e:
         http_error(502, f"Erro inesperado ao carregar perfil '{username}'.", e, debug)
 
-    # Coleta posts (limitado por max_posts) e respeita sleep_s entre iterações
+    # Coleta posts limitado por max_posts e respeita sleep_s entre iterações
     posts = []
     try:
         for i, post in enumerate(profile.get_posts(), start=1):
@@ -137,7 +139,7 @@ def mine_profile(
     except Exception as e:
         http_error(502, f"Erro inesperado ao varrer posts de '{username}'.", e, debug)
 
-    # Calcula o rate (engagement_rate) usando followers atuais
+    # Calcula o rate engagement_rate usando followers atuais
     followers = profile.followers or 0
     for p in posts:
         if followers > 0:
@@ -155,8 +157,8 @@ def mine_profile(
     elif sort == "best_engagement":
         posts.sort(key=lambda x: (x["engagement_rate"] is not None, x["engagement_rate"]), reverse=True)
 
-    # ✅ Filtro por "rate" (pedido do chefe)
-    # Observação: a biblioteca não filtra na origem; o filtro acontece no endpoint após calcular engagement_rate.
+    # Filtro por "rate"
+    #a biblioteca não filtra na origem, o filtro acontece no endpoint após calcular engagement_rate.
     if (min_rate is not None) or (top_rate is not None):
         # garante ordenação por rate para aplicar top_rate corretamente
         posts_by_rate = sorted(
@@ -221,7 +223,7 @@ def api_profile(
     caption_max_len: int = Query(2000, ge=0, le=10000, description="Limite de caracteres da legenda"),
     session_user: Optional[str] = Query(None, description="Usuário cuja sessão foi salva (load_session_from_file)"),
     debug: bool = Query(False, description="Se true, retorna stacktrace e detalhes completos do erro"),
-    # ✅ demanda do chefe (rate/performance)
+    # (rate/performance)
     min_rate: Optional[float] = Query(None, ge=0.0, le=1.0, description="Filtra posts com engagement_rate >= min_rate"),
     top_rate: Optional[int] = Query(None, ge=1, le=200, description="Retorna apenas os top N posts por engagement_rate"),
 ):
