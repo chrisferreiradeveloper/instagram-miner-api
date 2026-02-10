@@ -1,15 +1,17 @@
+import os
 import json
 import time
 import traceback
+import base64
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Literal, Optional, Any, Dict
 
+import requests
 import instaloader
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
-
-
-from instaloader.exceptions import (*
+from instaloader.exceptions import (
     BadCredentialsException,
     ConnectionException,
     LoginRequiredException,
@@ -18,7 +20,7 @@ from instaloader.exceptions import (*
     TwoFactorAuthRequiredException,
 )
 
-app = FastAPI(title="Instagram Miner API", version="1.1.0")
+app = FastAPI(title="Instagram Miner API", version="1.2.0")
 
 # Modos de ordenação suportados
 SortMode = Literal["recent", "most_liked", "most_commented", "best_engagement"]
@@ -157,10 +159,8 @@ def mine_profile(
     elif sort == "best_engagement":
         posts.sort(key=lambda x: (x["engagement_rate"] is not None, x["engagement_rate"]), reverse=True)
 
-    # Filtro por "rate"
-    #a biblioteca não filtra na origem, o filtro acontece no endpoint após calcular engagement_rate.
+    # Filtro por "rate" (após cálculo)
     if (min_rate is not None) or (top_rate is not None):
-        # garante ordenação por rate para aplicar top_rate corretamente
         posts_by_rate = sorted(
             posts,
             key=lambda x: (x["engagement_rate"] is not None, x["engagement_rate"]),
@@ -246,3 +246,143 @@ def api_profile(
         min_rate=min_rate,
         top_rate=top_rate,
     )
+
+
+# -----------------------------------
+# POC Gemini (análise + tokens)
+# -----------------------------------
+
+class GeminiAnalyzeRequest(BaseModel):
+    caption: str = Field(default="", description="Texto do post")
+    image_url: Optional[str] = Field(default=None, description="URL de uma imagem pública do post")
+    image_base64: Optional[str] = Field(default=None, description="Imagem em base64 (alternativa ao image_url)")
+    debug: bool = Field(default=False, description="Se true, retorna detalhes do erro")
+
+
+def _download_image_as_base64(url: str, timeout_s: int = 20) -> str:
+    r = requests.get(url, timeout=timeout_s, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return base64.b64encode(r.content).decode("utf-8")
+
+
+def _call_gemini_generate_content(parts: list, model: str) -> Dict[str, Any]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY não configurada")
+
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 700,
+        },
+    }
+
+    resp = requests.post(endpoint, json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def gemini_analyze(caption: str, image_b64: Optional[str], model: str) -> Dict[str, Any]:
+    """
+    Retorna um JSON com:
+    - sentiment (positivo/neutro/negativo)
+    - summary (até 3 linhas)
+    - similar_post_text (até 280 chars)
+    - similar_image_prompt (descrição da imagem sugerida)
+    - usage de tokens (quando disponível)
+    """
+    instruction = (
+        "Retorne APENAS um JSON válido, sem markdown e sem texto extra.\n"
+        "Campos obrigatórios:\n"
+        "sentiment: 'positivo' | 'neutro' | 'negativo'\n"
+        "summary: string (até 3 linhas)\n"
+        "similar_post_text: string (até 280 caracteres)\n"
+        "similar_image_prompt: string (descrição curta da imagem sugerida)\n"
+    )
+
+    parts = [{"text": f"{instruction}\n\nCaption:\n{caption}"}]
+
+    if image_b64:
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": image_b64,
+                }
+            }
+        )
+
+    data = _call_gemini_generate_content(parts=parts, model=model)
+
+    usage_md = data.get("usageMetadata") or {}
+    prompt_tokens = usage_md.get("promptTokenCount")
+    output_tokens = usage_md.get("candidatesTokenCount")
+    total_tokens = usage_md.get("totalTokenCount")
+
+    candidates = data.get("candidates") or []
+    raw_text = ""
+    if candidates:
+        content = candidates[0].get("content") or {}
+        out_parts = content.get("parts") or []
+        if out_parts and isinstance(out_parts[0], dict):
+            raw_text = out_parts[0].get("text", "")
+
+    parsed = None
+    try:
+        parsed = json.loads(raw_text) if raw_text else {}
+    except Exception:
+        parsed = {"raw": raw_text}
+
+    return {
+        "result": parsed,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        },
+        "model": model,
+    }
+
+
+@app.post("/v1/ai/gemini/analyze")
+def api_gemini_analyze(req: GeminiAnalyzeRequest):
+    """
+    POC: Analisa texto + imagem e retorna:
+    - sentimento
+    - resumo
+    - sugestão de post similar (texto)
+    - prompt/descrição de imagem sugerida
+    - uso de tokens (quando disponível)
+    """
+    try:
+        model = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+
+        image_b64 = None
+        if req.image_base64:
+            image_b64 = req.image_base64
+        elif req.image_url:
+            image_b64 = _download_image_as_base64(req.image_url)
+
+        return {
+            "ok": True,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "input": {
+                "caption_len": len(req.caption or ""),
+                "has_image": bool(image_b64),
+                "image_source": "base64" if req.image_base64 else ("url" if req.image_url else None),
+            },
+            "gemini": gemini_analyze(caption=req.caption or "", image_b64=image_b64, model=model),
+        }
+
+    except Exception as e:
+        detail = {
+            "message": "Falha ao executar análise no Gemini",
+            "error_type": type(e).__name__,
+            "error": str(e),
+        }
+        if req.debug:
+            detail["stack"] = traceback.format_exc()
+        raise HTTPException(status_code=502, detail=detail)
