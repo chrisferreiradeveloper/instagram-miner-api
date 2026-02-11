@@ -386,3 +386,4 @@ def api_gemini_analyze(req: GeminiAnalyzeRequest):
         if req.debug:
             detail["stack"] = traceback.format_exc()
         raise HTTPException(status_code=502, detail=detail)
+    
