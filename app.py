@@ -92,7 +92,7 @@ def mine_profile(
 
     L = build_loader(session_user=session_user, debug=debug)
 
-    # Carrega o perfil aqui acontecem boa parte dos 403/429
+    # Carrega o perfil (aqui acontecem boa parte dos 403/429)
     try:
         profile = instaloader.Profile.from_username(L.context, username)
     except (LoginRequiredException, BadCredentialsException, TwoFactorAuthRequiredException) as e:
@@ -209,7 +209,6 @@ def mine_profile(
 
 @app.get("/health")
 def health():
-    """Healthcheck simples."""
     return {"ok": True}
 
 
@@ -223,17 +222,9 @@ def api_profile(
     caption_max_len: int = Query(2000, ge=0, le=10000, description="Limite de caracteres da legenda"),
     session_user: Optional[str] = Query(None, description="Usuário cuja sessão foi salva (load_session_from_file)"),
     debug: bool = Query(False, description="Se true, retorna stacktrace e detalhes completos do erro"),
-    # (rate/performance)
     min_rate: Optional[float] = Query(None, ge=0.0, le=1.0, description="Filtra posts com engagement_rate >= min_rate"),
     top_rate: Optional[int] = Query(None, ge=1, le=200, description="Retorna apenas os top N posts por engagement_rate"),
 ):
-    """
-    Endpoint principal.
-    - Retorna dados do perfil e posts
-    - Calcula engagement_rate por post
-    - Permite filtrar posts por rate via min_rate/top_rate
-    - Permite debug=true para detalhar erros
-    """
     return mine_profile(
         username=username,
         max_posts=max_posts,
@@ -256,6 +247,7 @@ class GeminiAnalyzeRequest(BaseModel):
     caption: str = Field(default="", description="Texto do post")
     image_url: Optional[str] = Field(default=None, description="URL de uma imagem pública do post")
     image_base64: Optional[str] = Field(default=None, description="Imagem em base64 (alternativa ao image_url)")
+    image_mime: str = Field(default="image/jpeg", description="Mime type do base64 (image/jpeg, image/png, etc)")
     debug: bool = Field(default=False, description="Se true, retorna detalhes do erro")
 
 
@@ -285,7 +277,7 @@ def _call_gemini_generate_content(parts: list, model: str) -> Dict[str, Any]:
     return resp.json()
 
 
-def gemini_analyze(caption: str, image_b64: Optional[str], model: str) -> Dict[str, Any]:
+def gemini_analyze(caption: str, image_b64: Optional[str], image_mime: str, model: str) -> Dict[str, Any]:
     """
     Retorna um JSON com:
     - sentiment (positivo/neutro/negativo)
@@ -309,7 +301,7 @@ def gemini_analyze(caption: str, image_b64: Optional[str], model: str) -> Dict[s
         parts.append(
             {
                 "inline_data": {
-                    "mime_type": "image/jpeg",
+                    "mime_type": image_mime,
                     "data": image_b64,
                 }
             }
@@ -328,9 +320,9 @@ def gemini_analyze(caption: str, image_b64: Optional[str], model: str) -> Dict[s
         content = candidates[0].get("content") or {}
         out_parts = content.get("parts") or []
         if out_parts and isinstance(out_parts[0], dict):
-            raw_text = out_parts[0].get("text", "")
+            raw_text = out_parts[0].get("text", "") or ""
 
-    parsed = None
+    # tenta parsear como JSON, se falhar retorna bruto
     try:
         parsed = json.loads(raw_text) if raw_text else {}
     except Exception:
@@ -361,10 +353,19 @@ def api_gemini_analyze(req: GeminiAnalyzeRequest):
         model = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
 
         image_b64 = None
+        image_mime = req.image_mime or "image/jpeg"
+
         if req.image_base64:
             image_b64 = req.image_base64
         elif req.image_url:
             image_b64 = _download_image_as_base64(req.image_url)
+
+        gemini_out = gemini_analyze(
+            caption=req.caption or "",
+            image_b64=image_b64,
+            image_mime=image_mime,
+            model=model,
+        )
 
         return {
             "ok": True,
@@ -373,8 +374,9 @@ def api_gemini_analyze(req: GeminiAnalyzeRequest):
                 "caption_len": len(req.caption or ""),
                 "has_image": bool(image_b64),
                 "image_source": "base64" if req.image_base64 else ("url" if req.image_url else None),
+                "image_mime": image_mime if image_b64 else None,
             },
-            "gemini": gemini_analyze(caption=req.caption or "", image_b64=image_b64, model=model),
+            "gemini": gemini_out,
         }
 
     except Exception as e:
@@ -386,4 +388,3 @@ def api_gemini_analyze(req: GeminiAnalyzeRequest):
         if req.debug:
             detail["stack"] = traceback.format_exc()
         raise HTTPException(status_code=502, detail=detail)
-    

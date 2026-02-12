@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-instaloader
+instaloader[standard]
 requests
 pydantic
+
